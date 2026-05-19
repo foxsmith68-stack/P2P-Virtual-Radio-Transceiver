@@ -27,3 +27,6 @@ Station Directory: Double-click any active user in the directory to instantly tu
 Click **Commit changes** to save it. Now your page looks professional and ready for users.
 
 PLEASE Report any bugs
+
+
+<img width="1920" height="990" alt="Screenshot 2026-05-19 130135" src="https://github.com/user-attachments/assets/e8257d5c-0a15-470a-aa2c-c316f42c74d8" />
