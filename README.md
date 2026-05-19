@@ -39,3 +39,6 @@ You can do this right now in your command prompt:
 Look inside the newly created dist folder. You will find a standalone p2p_radio.exe file. You can upload that file directly to your GitHub page under the "Releases" section, and people can just double-click it to launch the radio instantly!
 
 Drop the link here once you set it up—it would be awesome to see people jumping onto the VFO dial!
+
+
+PLEASE Report any bugs
