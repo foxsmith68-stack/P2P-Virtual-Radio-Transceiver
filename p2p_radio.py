@@ -376,7 +376,9 @@ class MainWindow(QMainWindow):
         # PTT / Audio state
         self.ptt_active = False
         self.ptt_task: Optional[asyncio.Task] = None
+        self._capture_task: Optional[asyncio.Task] = None
         self.audio_manager: Optional[AudioManager] = None
+        self._audio_tx_queue: Optional[asyncio.Queue] = None
         self._audio_write_lock = asyncio.Lock()
 
         # Bridge network signals to Qt main thread
@@ -737,9 +739,11 @@ class MainWindow(QMainWindow):
             return
 
         self.ptt_active = True
+        self._audio_tx_queue = asyncio.Queue(maxsize=20)
         self._set_tx_visual_state()
         self._update_vfo_display()
         self.ptt_button.setChecked(True)
+        self._capture_task = asyncio.ensure_future(self._audio_capture_loop())
         self.ptt_task = asyncio.ensure_future(self._tx_audio_loop())
         self._log_rx(f"[TX] Voice transmission active")
 
@@ -748,23 +752,47 @@ class MainWindow(QMainWindow):
             return
 
         self.ptt_active = False
-        self.ptt_button.setChecked(False)
 
+        if self._capture_task is not None:
+            self._capture_task.cancel()
+            self._capture_task = None
         if self.ptt_task is not None:
             self.ptt_task.cancel()
             self.ptt_task = None
 
         self.audio_manager.close_input_stream()
+        self.ptt_button.setChecked(False)
 
         self._set_rx_visual_state()
         self._update_vfo_display()
         self._log_rx(f"[TX] Voice transmission ended")
 
-    async def _tx_audio_loop(self):
+    async def _audio_capture_loop(self):
+        """Read raw PCM chunks from mic into a bounded queue (drop oldest if full)."""
         loop = asyncio.get_event_loop()
         try:
             while self.ptt_active:
                 raw = await loop.run_in_executor(None, self.audio_manager.read_chunk)
+                if self._audio_tx_queue.full():
+                    try:
+                        self._audio_tx_queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        pass
+                await self._audio_tx_queue.put(raw)
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            self._log_rx(f"[WARN] Audio capture error: {e}")
+
+    async def _tx_audio_loop(self):
+        """Consume queued audio chunks, encode, and transmit to all peers."""
+        try:
+            while self.ptt_active:
+                try:
+                    raw = self._audio_tx_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    await asyncio.sleep(0.005)
+                    continue
                 encoded = base64.b64encode(raw).decode("ascii")
                 packet = json.dumps({
                     "type": "AUDIO",
@@ -786,7 +814,7 @@ class MainWindow(QMainWindow):
         except asyncio.CancelledError:
             pass
         except Exception as e:
-            self._log_rx(f"[WARN] TX audio error: {e}")
+            self._log_rx(f"[WARN] TX network error: {e}")
 
     # ------------------------------------------------------------------
     # Signal handlers (network -> UI thread)
