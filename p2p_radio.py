@@ -13,6 +13,8 @@ import random
 import time
 import os
 import base64
+import queue
+import threading
 from collections import OrderedDict
 from typing import Optional
 
@@ -376,15 +378,17 @@ class MainWindow(QMainWindow):
         # PTT / Audio state
         self.ptt_active = False
         self.ptt_task: Optional[asyncio.Task] = None
-        self._capture_task: Optional[asyncio.Task] = None
+        self._capture_thread: Optional[threading.Thread] = None
+        self._capture_stop = threading.Event()
         self.audio_manager: Optional[AudioManager] = None
-        self._audio_tx_queue: Optional[asyncio.Queue] = None
+        self._audio_tx_queue: Optional[queue.Queue] = None
         self._audio_write_lock = asyncio.Lock()
+        self.network_lock = asyncio.Lock()
 
         # Bridge network signals to Qt main thread
         self.bridge = NetworkBridge()
         self.bridge.heartbeat_received.connect(self._on_heartbeat)
-        self.bridge.transmit_received.connect(self._on_transmit)
+        self.bridge.transmit_received.connect(self._on_incoming_transmit)
         self.bridge.audio_received.connect(self._on_audio)
 
         self._build_ui()
@@ -683,29 +687,23 @@ class MainWindow(QMainWindow):
         if not message:
             return
         self.tx_input.clear()
-
-        self._send_text_packet(message)
         self._log_rx(f"[{self.callsign}] {message}")
+        asyncio.ensure_future(self._send_text_async(message))
 
-    def _send_text_packet(self, message: str):
+    async def _send_text_async(self, message: str):
         if self.protocol is None or self.protocol.transport is None:
             return
         packet = self.protocol.make_transmit(message)
-        addrs = []
-        for ip_port in list(self.peers.keys()):
-            parts = ip_port.split(":")
-            if len(parts) == 2:
-                try:
-                    addrs.append((parts[0], int(parts[1])))
-                except (ValueError, OSError):
-                    pass
-        try:
-            self.protocol.broadcast(packet, self.bound_port)
-        except Exception:
-            pass
-        for addr in addrs:
+        async with self.network_lock:
+            for ip_port in list(self.peers.keys()):
+                parts = ip_port.split(":")
+                if len(parts) == 2:
+                    try:
+                        self.protocol.send_to(packet, (parts[0], int(parts[1])))
+                    except (ValueError, OSError):
+                        pass
             try:
-                self.protocol.send_to(packet, addr)
+                self.protocol.broadcast(packet, self.bound_port)
             except Exception:
                 pass
 
@@ -739,11 +737,13 @@ class MainWindow(QMainWindow):
             return
 
         self.ptt_active = True
-        self._audio_tx_queue = asyncio.Queue(maxsize=20)
+        self._audio_tx_queue = queue.Queue(maxsize=20)
+        self._capture_stop.clear()
+        self._capture_thread = threading.Thread(target=self._audio_capture_thread_fn, daemon=True)
+        self._capture_thread.start()
         self._set_tx_visual_state()
         self._update_vfo_display()
         self.ptt_button.setChecked(True)
-        self._capture_task = asyncio.ensure_future(self._audio_capture_loop())
         self.ptt_task = asyncio.ensure_future(self._tx_audio_loop())
         self._log_rx(f"[TX] Voice transmission active")
 
@@ -752,10 +752,12 @@ class MainWindow(QMainWindow):
             return
 
         self.ptt_active = False
+        self._capture_stop.set()
 
-        if self._capture_task is not None:
-            self._capture_task.cancel()
-            self._capture_task = None
+        if self._capture_thread is not None and self._capture_thread.is_alive():
+            self._capture_thread.join(timeout=2)
+            self._capture_thread = None
+
         if self.ptt_task is not None:
             self.ptt_task.cancel()
             self.ptt_task = None
@@ -767,31 +769,30 @@ class MainWindow(QMainWindow):
         self._update_vfo_display()
         self._log_rx(f"[TX] Voice transmission ended")
 
-    async def _audio_capture_loop(self):
-        """Read raw PCM chunks from mic into a bounded queue (drop oldest if full)."""
-        loop = asyncio.get_event_loop()
+    def _audio_capture_thread_fn(self):
+        """Dedicated thread: read raw PCM chunks from mic into bounded queue."""
         try:
-            while self.ptt_active:
-                raw = await loop.run_in_executor(None, self.audio_manager.read_chunk)
+            while not self._capture_stop.is_set():
+                raw = self.audio_manager.read_chunk()
                 if self._audio_tx_queue.full():
                     try:
                         self._audio_tx_queue.get_nowait()
-                    except asyncio.QueueEmpty:
+                    except queue.Empty:
                         pass
-                await self._audio_tx_queue.put(raw)
-        except asyncio.CancelledError:
+                self._audio_tx_queue.put_nowait(raw)
+        except Exception:
             pass
-        except Exception as e:
-            self._log_rx(f"[WARN] Audio capture error: {e}")
 
     async def _tx_audio_loop(self):
         """Consume queued audio chunks, encode, and transmit to all peers."""
+        loop = asyncio.get_event_loop()
         try:
             while self.ptt_active:
                 try:
-                    raw = self._audio_tx_queue.get_nowait()
-                except asyncio.QueueEmpty:
-                    await asyncio.sleep(0.005)
+                    raw = await loop.run_in_executor(
+                        None, self._audio_tx_queue.get, True, 0.1
+                    )
+                except queue.Empty:
                     continue
                 encoded = base64.b64encode(raw).decode("ascii")
                 packet = json.dumps({
@@ -800,17 +801,18 @@ class MainWindow(QMainWindow):
                     "frequency": self.frequency,
                     "audio_data": encoded
                 })
-                for ip_port in list(self.peers.keys()):
-                    parts = ip_port.split(":")
-                    if len(parts) == 2:
-                        try:
-                            self.protocol.send_to(packet, (parts[0], int(parts[1])))
-                        except Exception:
-                            pass
-                try:
-                    self.protocol.broadcast(packet, self.bound_port)
-                except Exception:
-                    pass
+                async with self.network_lock:
+                    for ip_port in list(self.peers.keys()):
+                        parts = ip_port.split(":")
+                        if len(parts) == 2:
+                            try:
+                                self.protocol.send_to(packet, (parts[0], int(parts[1])))
+                            except Exception:
+                                pass
+                    try:
+                        self.protocol.broadcast(packet, self.bound_port)
+                    except Exception:
+                        pass
         except asyncio.CancelledError:
             pass
         except Exception as e:
@@ -828,7 +830,7 @@ class MainWindow(QMainWindow):
         }
         self._refresh_station_table()
 
-    def _on_transmit(self, callsign: str, frequency: int, payload: str):
+    def _on_incoming_transmit(self, callsign: str, frequency: int, payload: str):
         if abs(frequency - self.frequency) <= VIRTUAL_BW:
             self._log_rx(f"[{callsign}] {payload}")
 
@@ -866,6 +868,9 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def keyPressEvent(self, event: QKeyEvent):
+        if event.isAutoRepeat():
+            super().keyPressEvent(event)
+            return
         if (event.key() == Qt.Key.Key_Space
                 and not self.ptt_active
                 and not self.tx_input.hasFocus()
@@ -877,6 +882,9 @@ class MainWindow(QMainWindow):
             super().keyPressEvent(event)
 
     def keyReleaseEvent(self, event: QKeyEvent):
+        if event.isAutoRepeat():
+            super().keyReleaseEvent(event)
+            return
         if event.key() == Qt.Key.Key_Space and self.ptt_active:
             self._stop_ptt()
             event.accept()
